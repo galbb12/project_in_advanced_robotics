@@ -1,0 +1,45 @@
+# Data files
+test_images/
+tartanair_test/
+*.tar.gz
+*.zip
+*.png
+*.jpg
+*.jpeg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Checkpoints/models
+checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Logs and outputs
+*.log
+wandb/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db

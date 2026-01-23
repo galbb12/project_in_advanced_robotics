@@ -3,27 +3,25 @@
 Competition-Grade Monocular Visual Odometry
 
 Focus: Accurate rotation and translation DIRECTION (normalized).
-Metric scale from Depth Pro when available.
+Uses known camera intrinsics (K).
 
 Key techniques:
 1. USAC_MAGSAC for robust Essential Matrix estimation
-2. Proper 4-way E decomposition with cheirality validation
+2. Proper E decomposition with cheirality validation
 3. Local Bundle Adjustment for pose refinement
-4. Temporal consistency filtering for sequences
-5. High-quality feature matching with geometric verification
+4. High-quality feature matching (SuperPoint + LightGlue)
 """
 
 import sys
 import argparse
 from pathlib import Path
 import warnings
-from typing import Optional, Tuple, List, Dict
+from typing import Tuple, List
 from dataclasses import dataclass
 
 import numpy as np
 import cv2
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from scipy.spatial.transform import Rotation as Rot
 from scipy.optimize import least_squares
@@ -50,36 +48,15 @@ class MonocularVO:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.extractor = None
         self.matcher = None
-        self.depth_model = None
-        self.depth_transform = None
-
-        # Cache
         self.feature_cache = {}
-        self.depth_cache = {}
 
-    def load_models(self, use_depth=True):
-        """Load feature extraction and optional depth models."""
+    def load_models(self):
+        """Load feature extraction models."""
         from lightglue import LightGlue, SuperPoint
 
         print("Loading SuperPoint + LightGlue...")
         self.extractor = SuperPoint(max_num_keypoints=8192).eval().to(self.device)
         self.matcher = LightGlue(features='superpoint').eval().to(self.device)
-
-        if use_depth:
-            print("Loading Depth Pro...")
-            import depth_pro
-            from huggingface_hub import hf_hub_download
-
-            checkpoint_path = Path("./checkpoints/depth_pro.pt")
-            if not checkpoint_path.exists():
-                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                hf_hub_download(repo_id="apple/DepthPro", filename="depth_pro.pt",
-                              local_dir="./checkpoints")
-
-            self.depth_model, self.depth_transform = depth_pro.create_model_and_transforms(
-                device=self.device
-            )
-            self.depth_model.eval()
 
     def extract_features(self, image_path: str) -> dict:
         """Extract SuperPoint features with caching."""
@@ -125,34 +102,6 @@ class MonocularVO:
 
         return pts1, pts2, valid_scores
 
-    def get_depth(self, image_path: str) -> Tuple[np.ndarray, float]:
-        """Get depth map and focal length from Depth Pro."""
-        if self.depth_model is None:
-            return None, None
-
-        if image_path in self.depth_cache:
-            return self.depth_cache[image_path]
-
-        image = Image.open(image_path).convert("RGB")
-        original_size = image.size
-        image_tensor = self.depth_transform(image).to(self.device)
-
-        with torch.no_grad():
-            pred = self.depth_model.infer(image_tensor)
-
-        depth = pred["depth"].squeeze().cpu().numpy()
-        focal = pred["focallength_px"].item()
-
-        # Resize depth to original size
-        if depth.shape[0] != original_size[1] or depth.shape[1] != original_size[0]:
-            depth_t = torch.from_numpy(depth).unsqueeze(0).unsqueeze(0)
-            depth = F.interpolate(depth_t, size=(original_size[1], original_size[0]),
-                                 mode='bilinear', align_corners=False).squeeze().numpy()
-            focal *= original_size[0] / pred["depth"].shape[-1]
-
-        self.depth_cache[image_path] = (depth, focal)
-        return depth, focal
-
     def triangulate_points(self, pts1: np.ndarray, pts2: np.ndarray,
                           R: np.ndarray, t: np.ndarray, K: np.ndarray) -> np.ndarray:
         """Triangulate 3D points from two views."""
@@ -183,14 +132,16 @@ class MonocularVO:
         """
         Decompose Essential matrix and select best solution via cheirality.
         Returns R, t (normalized), and number of valid points.
+
+        OpenCV recoverPose returns R, t such that:
+        - R rotates points from cam1 to cam2 frame
+        - t is the translation of cam2 origin in cam1 frame (unit vector)
         """
-        # Use cv2.recoverPose which handles cheirality internally
         n_valid, R, t, mask = cv2.recoverPose(E, pts1, pts2, K)
         t = t.ravel()
 
-        # recoverPose gives: P2 = R @ P1 + t (transform points from cam1 to cam2)
-        # For camera motion (cam2 position in cam1 frame): t_motion = -R.T @ t
-        t = -R.T @ t
+        # Transform t to cam1 frame
+        t = R.T @ t
         t = t / (np.linalg.norm(t) + 1e-8)
 
         return R, t, n_valid
@@ -292,36 +243,6 @@ class MonocularVO:
         except:
             return R, t
 
-    def recover_scale(self, pts1: np.ndarray, R: np.ndarray, t: np.ndarray,
-                     depth_map: np.ndarray, focal: float, cx: float, cy: float) -> float:
-        """
-        Recover metric scale using depth map.
-        """
-        scales = []
-
-        for u, v in pts1:
-            u_int, v_int = int(round(u)), int(round(v))
-            if 0 <= u_int < depth_map.shape[1] and 0 <= v_int < depth_map.shape[0]:
-                z = depth_map[v_int, u_int]
-                if 0.1 < z < 100:
-                    # 3D point in camera 1
-                    x = (u - cx) * z / focal
-                    y = (v - cy) * z / focal
-
-                    # The baseline is ||t|| * scale
-                    # depth ≈ baseline * focal / disparity
-                    # Rough scale from depth
-                    scales.append(z)
-
-        if len(scales) > 10:
-            median_depth = np.median(scales)
-            # Scale factor: assume t is unit vector, real translation ≈ 1-5% of median depth
-            # This is a heuristic based on typical camera motion
-            scale = median_depth * 0.02  # 2% of median depth as baseline
-            return max(0.01, min(scale, 10.0))  # Clamp to reasonable range
-
-        return 0.1  # Default 10cm if no valid depth
-
     def estimate_pose(self, img1_path: str, img2_path: str,
                      focal: float = None, use_ba: bool = True) -> PoseEstimate:
         """
@@ -337,14 +258,9 @@ class MonocularVO:
         W, H = img.size
         cx, cy = W / 2, H / 2
 
-        # Get depth and focal if available
-        depth_map, depth_focal = None, None
-        if self.depth_model is not None:
-            depth_map, depth_focal = self.get_depth(img1_path)
-
-        # Use provided focal or estimated focal
+        # Use provided focal or default estimate
         if focal is None:
-            focal = depth_focal if depth_focal else max(W, H) * 1.2
+            focal = max(W, H) * 1.2
 
         K = np.array([[focal, 0, cx], [0, focal, cy], [0, 0, 1]], dtype=np.float64)
 
@@ -356,7 +272,7 @@ class MonocularVO:
 
         n_matches = len(pts1)
 
-        # Robust Essential Matrix estimation
+        # Essential Matrix estimation
         E, inlier_mask, n_inliers = self.estimate_essential_robust(pts1, pts2, K)
 
         if E is None or n_inliers < 10:
@@ -383,12 +299,7 @@ class MonocularVO:
             R, t = self.refine_pose_ba(pts1_in, pts2_in, R, t, K)
             t = t / (np.linalg.norm(t) + 1e-8)
 
-        # Recover metric scale if depth available
-        if depth_map is not None:
-            scale = self.recover_scale(pts1_in, R, t, depth_map, focal, cx, cy)
-            t_scaled = t * scale
-        else:
-            t_scaled = t * 0.1  # Default 10cm
+        t_scaled = t * 0.1  # Default 10cm when no depth
 
         # Compute confidence
         inlier_ratio = n_inliers / n_matches
@@ -406,8 +317,120 @@ class MonocularVO:
         )
 
 
+def compute_rpe(R_est: np.ndarray, t_est: np.ndarray,
+                R_gt: np.ndarray, t_gt: np.ndarray) -> dict:
+    """
+    Compute Relative Pose Error (RPE) between estimated and ground truth relative poses.
+
+    Returns:
+        dict with 'rot_err' (degrees), 'trans_err' (meters), 'trans_err_rel' (ratio)
+    """
+    # Rotation error: geodesic distance
+    R_err = R_gt @ R_est.T
+    rot_err = np.abs(np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1, 1))) * 180 / np.pi
+
+    # Translation error: Euclidean distance
+    trans_err = np.linalg.norm(t_est - t_gt)
+
+    # Relative translation error (normalized by GT distance)
+    gt_dist = np.linalg.norm(t_gt)
+    trans_err_rel = trans_err / gt_dist if gt_dist > 1e-6 else 0
+
+    return {
+        'rot_err': rot_err,
+        'trans_err': trans_err,
+        'trans_err_rel': trans_err_rel,
+        'gt_dist': gt_dist
+    }
+
+
+def compute_ate(est_traj: np.ndarray, gt_traj: np.ndarray) -> dict:
+    """
+    Compute Absolute Trajectory Error (ATE) after Sim(3) alignment.
+
+    Args:
+        est_traj: Nx3 array of estimated positions
+        gt_traj: Nx3 array of ground truth positions
+
+    Returns:
+        dict with 'rmse', 'mean', 'median', 'std', 'scale'
+    """
+    assert len(est_traj) == len(gt_traj)
+
+    # Umeyama alignment (Sim(3): rotation, translation, scale)
+    # Center the point clouds
+    est_centered = est_traj - est_traj.mean(axis=0)
+    gt_centered = gt_traj - gt_traj.mean(axis=0)
+
+    # Compute scale
+    est_var = np.sum(est_centered ** 2)
+    gt_var = np.sum(gt_centered ** 2)
+    scale = np.sqrt(gt_var / est_var) if est_var > 1e-10 else 1.0
+
+    # Compute rotation using SVD
+    H = est_centered.T @ gt_centered
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Ensure proper rotation (det = 1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    # Compute translation
+    t = gt_traj.mean(axis=0) - scale * (R @ est_traj.mean(axis=0))
+
+    # Apply alignment
+    est_aligned = scale * (est_traj @ R.T) + t
+
+    # Compute errors
+    errors = np.linalg.norm(est_aligned - gt_traj, axis=1)
+
+    return {
+        'rmse': np.sqrt(np.mean(errors ** 2)),
+        'mean': np.mean(errors),
+        'median': np.median(errors),
+        'std': np.std(errors),
+        'min': np.min(errors),
+        'max': np.max(errors),
+        'scale': scale,
+        'aligned_traj': est_aligned
+    }
+
+
+def compute_kitti_metrics(rpe_results: List[dict]) -> dict:
+    """
+    Compute KITTI-style metrics.
+
+    KITTI uses:
+    - Translation error: % of path length
+    - Rotation error: deg/m
+
+    Returns:
+        dict with 't_err_pct' (trans error %), 'r_err_per_m' (rot error deg/m)
+    """
+    if not rpe_results:
+        return {'t_err_pct': 0, 'r_err_per_m': 0}
+
+    total_dist = sum(r['gt_dist'] for r in rpe_results)
+    total_trans_err = sum(r['trans_err'] for r in rpe_results)
+    total_rot_err = sum(r['rot_err'] for r in rpe_results)
+
+    # Translation error as percentage of path
+    t_err_pct = 100 * total_trans_err / total_dist if total_dist > 0 else 0
+
+    # Rotation error per meter
+    r_err_per_m = total_rot_err / total_dist if total_dist > 0 else 0
+
+    return {
+        't_err_pct': t_err_pct,
+        'r_err_per_m': r_err_per_m,
+        'total_dist': total_dist
+    }
+
+
 def evaluate_on_icl_nuim(vo: MonocularVO, data_dir: Path, frame_step: int, num_pairs: int):
-    """Evaluate on ICL-NUIM dataset."""
+    """Evaluate on ICL-NUIM dataset with comprehensive metrics."""
     # Load ground truth
     gt_file = data_dir / "livingRoom2.gt.freiburg"
     gt_poses = {}
@@ -418,10 +441,17 @@ def evaluate_on_icl_nuim(vo: MonocularVO, data_dir: Path, frame_step: int, num_p
             fid = int(parts[0])
             t = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
             q = np.array([float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])])
-            gt_poses[fid] = {'t': t, 'q': q}
+            gt_poses[fid] = {'t': t, 'q': q, 'R': Rot.from_quat(q).as_matrix()}
 
     results = []
+    rpe_results = []
     frame_pairs = [(i, i + frame_step) for i in range(0, num_pairs * frame_step, frame_step)]
+
+    # Trajectory accumulation
+    est_trajectory = [np.zeros(3)]  # Start at origin
+    gt_trajectory = []
+    est_R_accum = np.eye(3)
+    est_t_accum = np.zeros(3)
 
     print(f"\nEvaluating {len(frame_pairs)} frame pairs (step={frame_step})...")
     print("-" * 70)
@@ -439,13 +469,19 @@ def evaluate_on_icl_nuim(vo: MonocularVO, data_dir: Path, frame_step: int, num_p
         if gt_a is None or gt_b is None:
             continue
 
+        # Store GT trajectory points
+        if len(gt_trajectory) == 0:
+            gt_trajectory.append(gt_a['t'].copy())
+        gt_trajectory.append(gt_b['t'].copy())
+
         # Ground truth relative pose
-        R_a = Rot.from_quat(gt_a['q']).as_matrix()
-        R_b = Rot.from_quat(gt_b['q']).as_matrix()
-        R_gt = R_a.T @ R_b
-        t_gt = R_a.T @ (gt_b['t'] - gt_a['t'])
-        t_gt_norm = t_gt / (np.linalg.norm(t_gt) + 1e-8)
-        gt_dist = np.linalg.norm(t_gt)
+        R_a, R_b = gt_a['R'], gt_b['R']
+        # Relative rotation: transforms vectors from cam_a to cam_b
+        R_gt_rel = R_b.T @ R_a
+        # Relative translation: position of cam_b relative to cam_a, in cam_a frame
+        # Direction from cam_b to cam_a (matches recoverPose convention)
+        t_gt_rel = R_a.T @ (gt_a['t'] - gt_b['t'])
+        gt_dist = np.linalg.norm(t_gt_rel)
 
         # Estimate pose
         pose = vo.estimate_pose(str(img_a), str(img_b), focal=481.2)
@@ -453,38 +489,73 @@ def evaluate_on_icl_nuim(vo: MonocularVO, data_dir: Path, frame_step: int, num_p
         if pose.method.endswith("failed"):
             print(f"  {frame_a} → {frame_b}: FAILED ({pose.method})")
             results.append({'success': False, 'frame_a': frame_a, 'frame_b': frame_b})
+            # Use identity for failed estimates in trajectory
+            est_trajectory.append(est_t_accum.copy())
             continue
 
-        # Rotation error (geodesic)
-        R_err = R_gt @ pose.R.T
-        rot_err = np.abs(np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1, 1))) * 180 / np.pi
+        # Scale estimated translation to match GT distance (for fair comparison)
+        t_est_scaled = pose.t * gt_dist
 
-        # Translation direction error
+        # Accumulate trajectory
+        est_t_accum = est_t_accum + est_R_accum @ t_est_scaled
+        est_R_accum = est_R_accum @ pose.R.T  # Accumulate rotation
+        est_trajectory.append(est_t_accum.copy())
+
+        # Compute RPE
+        rpe = compute_rpe(pose.R, t_est_scaled, R_gt_rel, t_gt_rel)
+        rpe_results.append(rpe)
+
+        # Direction error (for backward compatibility)
+        t_gt_norm = t_gt_rel / (gt_dist + 1e-8)
         if gt_dist > 0.001:
             cos_angle = np.clip(np.dot(t_gt_norm, pose.t), -1, 1)
             dir_err = np.arccos(cos_angle) * 180 / np.pi
         else:
             dir_err = 0
 
-        # Scale error
-        est_dist = np.linalg.norm(pose.t_scaled)
-        scale_err = abs(est_dist - gt_dist) / gt_dist if gt_dist > 0.001 else 0
-
-        print(f"  {frame_a:3d} → {frame_b:3d}: rot={rot_err:5.1f}°  dir={dir_err:5.1f}°  "
-              f"scale={scale_err*100:5.1f}%  inliers={pose.n_inliers}")
+        print(f"  {frame_a:3d} → {frame_b:3d}: rot={rpe['rot_err']:5.1f}°  dir={dir_err:5.1f}°  "
+              f"t_err={rpe['trans_err']:.3f}m  inliers={pose.n_inliers}")
 
         results.append({
             'success': True,
             'frame_a': frame_a, 'frame_b': frame_b,
-            'rot_err': rot_err, 'dir_err': dir_err, 'scale_err': scale_err,
-            'gt_dist': gt_dist, 'est_dist': est_dist, 'n_inliers': pose.n_inliers
+            'rot_err': rpe['rot_err'],
+            'dir_err': dir_err,
+            'trans_err': rpe['trans_err'],
+            'trans_err_rel': rpe['trans_err_rel'],
+            'gt_dist': gt_dist,
+            'n_inliers': pose.n_inliers,
+            'R_est': pose.R,
+            't_est': t_est_scaled
         })
 
-    return results
+    # Compute ATE if we have trajectory
+    ate_results = None
+    if len(est_trajectory) > 2 and len(gt_trajectory) > 2:
+        est_traj_arr = np.array(est_trajectory[:len(gt_trajectory)])
+        gt_traj_arr = np.array(gt_trajectory)
+        ate_results = compute_ate(est_traj_arr, gt_traj_arr)
+
+    # Compute KITTI metrics
+    kitti_results = compute_kitti_metrics(rpe_results)
+
+    return {
+        'frame_results': results,
+        'rpe_results': rpe_results,
+        'ate_results': ate_results,
+        'kitti_results': kitti_results,
+        'est_trajectory': np.array(est_trajectory),
+        'gt_trajectory': np.array(gt_trajectory) if gt_trajectory else None
+    }
 
 
-def print_results(results: List[dict]):
-    """Print evaluation summary."""
+def print_results(eval_results: dict):
+    """Print comprehensive evaluation summary."""
+    results = eval_results['frame_results']
+    rpe_results = eval_results['rpe_results']
+    ate_results = eval_results['ate_results']
+    kitti_results = eval_results['kitti_results']
+
     successful = [r for r in results if r['success']]
     if not successful:
         print("No successful estimates!")
@@ -492,33 +563,49 @@ def print_results(results: List[dict]):
 
     rot_errs = np.array([r['rot_err'] for r in successful])
     dir_errs = np.array([r['dir_err'] for r in successful])
-    scale_errs = np.array([r['scale_err'] for r in successful])
+    trans_errs = np.array([r['trans_err'] for r in successful])
 
     print(f"\n{'=' * 70}")
-    print("RESULTS")
+    print("EVALUATION RESULTS")
     print(f"{'=' * 70}")
     print(f"Success rate: {len(successful)}/{len(results)} ({100*len(successful)/len(results):.1f}%)")
 
-    print(f"\nRotation Error:")
-    print(f"  Mean: {np.mean(rot_errs):.2f}°  Median: {np.median(rot_errs):.2f}°")
-    print(f"  < 2°: {100*np.mean(rot_errs < 2):.1f}%  < 5°: {100*np.mean(rot_errs < 5):.1f}%  "
-          f"< 10°: {100*np.mean(rot_errs < 10):.1f}%")
+    # RPE - Relative Pose Error
+    print(f"\n--- RPE (Relative Pose Error) ---")
+    print(f"Rotation Error:")
+    print(f"  Mean: {np.mean(rot_errs):.2f}°  Median: {np.median(rot_errs):.2f}°  Std: {np.std(rot_errs):.2f}°")
+    print(f"  < 1°: {100*np.mean(rot_errs < 1):.1f}%  < 2°: {100*np.mean(rot_errs < 2):.1f}%  "
+          f"< 5°: {100*np.mean(rot_errs < 5):.1f}%  < 10°: {100*np.mean(rot_errs < 10):.1f}%")
 
-    print(f"\nDirection Error:")
-    print(f"  Mean: {np.mean(dir_errs):.2f}°  Median: {np.median(dir_errs):.2f}°")
+    print(f"Translation Direction Error:")
+    print(f"  Mean: {np.mean(dir_errs):.2f}°  Median: {np.median(dir_errs):.2f}°  Std: {np.std(dir_errs):.2f}°")
     print(f"  < 5°: {100*np.mean(dir_errs < 5):.1f}%  < 10°: {100*np.mean(dir_errs < 10):.1f}%  "
           f"< 20°: {100*np.mean(dir_errs < 20):.1f}%")
 
-    print(f"\nScale Error:")
-    print(f"  Mean: {100*np.mean(scale_errs):.1f}%  Median: {100*np.median(scale_errs):.1f}%")
+    print(f"Translation Error (after scale alignment):")
+    print(f"  Mean: {np.mean(trans_errs):.4f}m  Median: {np.median(trans_errs):.4f}m  Std: {np.std(trans_errs):.4f}m")
 
-    # Accuracy at different thresholds
-    print(f"\n{'=' * 70}")
-    print("ACCURACY (rotation AND direction):")
-    for r_th in [5, 10]:
-        for d_th in [5, 10, 15]:
+    # KITTI-style metrics
+    print(f"\n--- KITTI Metrics ---")
+    print(f"Translation Error: {kitti_results['t_err_pct']:.2f}% of path length")
+    print(f"Rotation Error: {kitti_results['r_err_per_m']:.4f} deg/m")
+    print(f"Total Path Length: {kitti_results['total_dist']:.2f}m")
+
+    # ATE - Absolute Trajectory Error
+    if ate_results:
+        print(f"\n--- ATE (Absolute Trajectory Error, Sim(3) aligned) ---")
+        print(f"RMSE: {ate_results['rmse']:.4f}m")
+        print(f"Mean: {ate_results['mean']:.4f}m  Median: {ate_results['median']:.4f}m  Std: {ate_results['std']:.4f}m")
+        print(f"Min: {ate_results['min']:.4f}m  Max: {ate_results['max']:.4f}m")
+        print(f"Scale factor: {ate_results['scale']:.4f}")
+
+    # Combined accuracy
+    print(f"\n--- Combined Accuracy (rot AND dir) ---")
+    for r_th in [2, 5, 10]:
+        for d_th in [5, 10, 20]:
             acc = 100 * np.mean((rot_errs < r_th) & (dir_errs < d_th))
             print(f"  rot<{r_th}° AND dir<{d_th}°: {acc:.1f}%")
+
     print(f"{'=' * 70}")
 
 
@@ -527,7 +614,6 @@ def main():
     parser.add_argument("--data-dir", type=str, default="test_images")
     parser.add_argument("--frame-step", type=int, default=10)
     parser.add_argument("--num-pairs", type=int, default=30)
-    parser.add_argument("--no-depth", action="store_true", help="Disable depth estimation")
     parser.add_argument("--no-ba", action="store_true", help="Disable bundle adjustment")
     args = parser.parse_args()
 
@@ -536,7 +622,7 @@ def main():
     print("=" * 70)
 
     vo = MonocularVO()
-    vo.load_models(use_depth=not args.no_depth)
+    vo.load_models()
 
     data_dir = Path(args.data_dir)
     results = evaluate_on_icl_nuim(vo, data_dir, args.frame_step, args.num_pairs)

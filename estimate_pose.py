@@ -24,11 +24,49 @@ import cv2
 import torch
 
 
+def get_device(preferred: str = 'auto') -> torch.device:
+    """
+    Get the best available device for PyTorch.
+
+    Args:
+        preferred: 'auto', 'cuda', 'mps', or 'cpu'
+                  'auto' will detect the best available device
+
+    Returns:
+        torch.device for the selected backend
+    """
+    if preferred == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return torch.device('mps')
+        else:
+            return torch.device('cpu')
+    elif preferred == 'cuda':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("Warning: CUDA not available, falling back to CPU")
+        return torch.device('cpu')
+    elif preferred == 'mps':
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return torch.device('mps')
+        print("Warning: MPS not available, falling back to CPU")
+        return torch.device('cpu')
+    else:
+        return torch.device('cpu')
+
+
 class PoseEstimator:
     """Estimates relative pose between two images using feature matching + Essential matrix."""
 
-    def __init__(self, device: str = 'cuda'):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    def __init__(self, device: str = 'auto'):
+        """
+        Initialize the pose estimator.
+
+        Args:
+            device: 'auto' (detect best), 'cuda', 'mps' (Apple Silicon), or 'cpu'
+        """
+        self.device = get_device(device)
         self.extractor = None
         self.matcher = None
         self.feature_cache = {}
@@ -266,6 +304,10 @@ def main():
     parser.add_argument("--cx", type=float, help="Principal point x")
     parser.add_argument("--cy", type=float, help="Principal point y")
 
+    # Distortion correction
+    parser.add_argument("--dist", type=str, help="Distortion coefficients (comma-separated: k1,k2,k3,k4)")
+    parser.add_argument("--fisheye", action="store_true", help="Use fisheye distortion model")
+
     parser.add_argument("--output", type=str, help="Output file (JSON format)")
     parser.add_argument("--quiet", action="store_true", help="Suppress console output")
 
@@ -282,11 +324,17 @@ def main():
         print("Error: Must provide either --K file or --fx, --cx, --cy", file=sys.stderr)
         sys.exit(1)
 
+    # Parse distortion coefficients
+    dist_coeffs = None
+    if args.dist:
+        dist_coeffs = np.array([float(x) for x in args.dist.split(',')])
+
     # Estimate pose
     estimator = PoseEstimator()
     estimator.load_models()
 
-    result = estimator.estimate(args.img1, args.img2, K)
+    result = estimator.estimate(args.img1, args.img2, K,
+                                dist_coeffs=dist_coeffs, fisheye=args.fisheye)
 
     # Output
     if result['success']:
@@ -294,8 +342,8 @@ def main():
             'success': True,
             'R': result['R'].tolist(),
             't': result['t'].tolist(),
-            'n_inliers': result['n_inliers'],
-            'n_matches': result['n_matches']
+            'n_inliers': int(result['n_inliers']),
+            'n_matches': int(result['n_matches'])
         }
 
         if not args.quiet:

@@ -1,0 +1,23 @@
+# Monocular Visual Odometry Dependencies
+
+# Core dependencies
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+matplotlib>=3.7.0
+
+# Deep learning
+# PyTorch: Install the appropriate version for your platform:
+#   - CUDA:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   - CPU:   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   - Mac:   pip install torch torchvision (MPS support included)
+torch>=2.0.0
+kornia>=0.7.0
+
+# LightGlue (feature matching)
+git+https://github.com/cvg/LightGlue.git
+
+# Jupyter notebook (for README.ipynb)
+notebook>=7.0.0
+nbclient>=0.10.0
+ipykernel>=6.0.0

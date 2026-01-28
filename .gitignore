@@ -6,6 +6,8 @@ tartanair_test/
 *.png
 *.jpg
 *.jpeg
+!assets/*.png
+!assets/*.gif
 
 # Python
 __pycache__/
